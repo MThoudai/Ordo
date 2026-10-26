@@ -1,0 +1,43 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Runtime state and generated files
+**/data/
+**/logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+node_modules/
+dist/
+build/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage/
+.coverage
+
+# Local development notes and test outputs
+AGENTS.md
+dev-notes/
+validation/
+test-results/
+playwright-report/
+screenshots/
+*.bak
+*.zip
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

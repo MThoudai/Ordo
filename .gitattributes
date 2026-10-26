@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.md whitespace=-blank-at-eol
+*.sh text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.vue text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+Dockerfile text eol=lf

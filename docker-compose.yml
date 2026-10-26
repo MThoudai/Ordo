@@ -1,0 +1,107 @@
+name: ordo
+
+services:
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Use compose.ps1 or compose.sh to load backend/.env}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Load backend/.env}"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  chromadb:
+    image: chromadb/chroma:0.5.23
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - chromadb-data:/chroma/chroma
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/heartbeat', timeout=5).read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  backend:
+    image: ordo-backend:local
+    build:
+      context: ./backend
+      target: production
+    env_file:
+      - ./backend/.env
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Load backend/.env}@redis:6379/0
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+      CHROMA_PERSIST_DIRECTORY: /app/data/chroma
+      EVAL_BASELINE_PATH: /app/data/eval/baseline.json
+      ORDO_SKILLS_DIR: /app/skills
+      PROMETHEUS_PORT: "9091"
+    ports:
+      - "127.0.0.1:${ORDO_BACKEND_PORT:-18000}:8000"
+    volumes:
+      - backend-data:/app/data
+      - backend-logs:/app/logs
+      - ./backend/skills:/app/skills:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+
+  frontend:
+    image: ordo-frontend:local
+    build:
+      context: ./frontend
+    environment:
+      PYTHON_API_URL: /api
+    ports:
+      - "127.0.0.1:${ORDO_FRONTEND_PORT:-5175}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=200h
+    ports:
+      - "127.0.0.1:${ORDO_METRICS_PORT:-19090}:9090"
+    volumes:
+      - ./backend/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  chromadb-data:
+  backend-data:
+  backend-logs:
+  prometheus-data:

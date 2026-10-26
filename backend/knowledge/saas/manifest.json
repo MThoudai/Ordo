@@ -1,0 +1,54 @@
+{
+  "corpus_id": "ordo_saas",
+  "version": "1.0.0",
+  "documents": [
+    {
+      "document_id": "saas-product-overview",
+      "title": "协作平台与 Ordo 智能支持中心概述及支持范围",
+      "file": "01_产品概述与支持范围.md",
+      "agents": "general,collaboration,technical"
+    },
+    {
+      "document_id": "saas-quickstart",
+      "title": "协作平台快速入门指南",
+      "file": "02_快速入门.md",
+      "agents": "general,collaboration"
+    },
+    {
+      "document_id": "saas-feature-guide",
+      "title": "项目管理、成员邀请、文档协作与分享指南",
+      "file": "03_项目成员邀请与分享指南.md",
+      "agents": "general,collaboration"
+    },
+    {
+      "document_id": "saas-roles-permissions",
+      "title": "成员角色与项目权限管理指南",
+      "file": "04_成员角色与项目权限.md",
+      "agents": "general,collaboration,technical"
+    },
+    {
+      "document_id": "saas-api-reference",
+      "title": "协作平台 API 接入指南与接口说明",
+      "file": "05_API接入指南与接口说明.md",
+      "agents": "technical"
+    },
+    {
+      "document_id": "saas-api-troubleshooting",
+      "title": "协作平台 API 错误排查手册",
+      "file": "06_API错误排查手册.md",
+      "agents": "technical,collaboration"
+    },
+    {
+      "document_id": "saas-support-process",
+      "title": "权限申请、问题反馈与支持工单流程",
+      "file": "07_权限申请人工支持与工单流程.md",
+      "agents": "general,collaboration,technical"
+    },
+    {
+      "document_id": "saas-platform-troubleshooting",
+      "title": "平台常见技术故障排查",
+      "file": "08_平台常见技术故障排查.md",
+      "agents": "technical,collaboration"
+    }
+  ]
+}
