@@ -27,6 +27,7 @@ coverage/
 .coverage
 
 # Local development notes and test outputs
+/指标测试.md
 AGENTS.md
 dev-notes/
 validation/

@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from anthropic import AsyncAnthropic
 
 from core.llm_utils import extract_text_content, parse_json_response, response_metadata, short_task_options
+from tooling.retrieval import fuse_rankings
 
 logger = logging.getLogger(__name__)
 
@@ -310,9 +311,7 @@ class MCPToolManager:
         context: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
         """
-        完整的检索优化链路：查询改写 → 并行召回 → 去重 → 重排 → Top-K
-
-        这是解决"检索不全、召回不好"的完整方案。
+        查询改写 → 并行召回 → 融合去重 → 重排 → Top-K。
         """
         # 1. 查询改写：生成多角度子查询
         top_k = max(1, min(int(top_k), 20))
@@ -320,7 +319,7 @@ class MCPToolManager:
         logger.info(f"查询改写: {query!r} → {sub_queries}")
 
         # 2. 并行召回：所有子查询同时检索
-        recall_k = max(top_k, 5)
+        recall_k = min(max(top_k * 2, 10), 20)
         tasks = [
             self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
             for q in sub_queries
@@ -328,17 +327,26 @@ class MCPToolManager:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # 3. 同一片段不同召回分数仍是同一证据。
-        seen, merged = set(), []
+        seen, merged, rankings = set(), [], []
         for r in results:
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
+                ranking = []
                 for item in r.data:
                     if isinstance(item, dict) and item.get("fallback"):
                         continue
                     key = item.get("chunk_id") if isinstance(item, dict) else None
                     key = key or hashlib.md5(str(item).encode()).hexdigest()
+                    if isinstance(item, dict) and item.get("chunk_id"):
+                        ranking.append(item)
                     if key not in seen:
                         seen.add(key)
                         merged.append(item)
+                if ranking:
+                    rankings.append(ranking)
+
+        # 限制模型输入，同时避免原查询的结果在拼接顺序上独占前排。
+        if rankings and all(isinstance(item, dict) and item.get("chunk_id") for item in merged):
+            merged = fuse_rankings(rankings, max(24, top_k))
 
         if not merged:
             return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无有效结果",
@@ -443,15 +451,15 @@ class MCPToolManager:
         """
         用 LLM 将原始查询改写为 n 个不同角度的子查询。
 
-        目的：单一查询往往只能召回某一角度的文档，
-        多角度子查询并行检索后合并，显著提升召回率。
+        复合问题允许按子问题拆分，原问题始终参与召回。
 
         示例：
           原始: "项目访问申请"
           改写: ["如何申请项目read权限", "项目申请提交与授权生效的区别"]
         """
         prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
-要求：只改写表达，不增加或更换操作目标。保留否定条件、对象ID、接口路径、scope及错误码。
+要求：不增加或更换操作目标，不改变否定条件、权限范围和事实。
+复合问题可以拆成分别检索的子问题；每条只需保留该子问题相关的对象ID、接口路径、scope及错误码，不能编造或替换这些值。
 “创建项目”不能替换成“创建工作空间”，不补造功能或菜单。只返回JSON字符串数组。
 原始查询: "{query}"
 返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
@@ -467,8 +475,16 @@ class MCPToolManager:
             queries = parse_json_response(resp, list)
             if not queries or not all(isinstance(q, str) and q.strip() for q in queries):
                 raise ValueError("invalid_query_array")
-            anchors = re.findall(r"project:read|RATE_LIMITED|QUOTA_EXCEEDED|(?<![A-Za-z0-9])[45]\d{2}(?![A-Za-z0-9])|(?:proj|ws)_[A-Za-z0-9_-]+|/sandbox/[^\s，。？?]+", query, re.I)
-            queries = [q.strip() for q in queries[:n] if all(anchor.lower() in q.lower() for anchor in anchors)]
+            anchors = self._query_anchors(query)
+            valid = []
+            for candidate in queries[:n]:
+                candidate = candidate.strip()[:2000]
+                candidate_anchors = self._query_anchors(candidate)
+                # 允许原锚点的子集，禁止新值；带锚点的原问题不能变成无条件泛问。
+                if not (candidate_anchors - anchors) and (not anchors or candidate_anchors):
+                    valid.append(candidate)
+            info["rejected_queries"] = len(queries[:n]) - len(valid)
+            queries = valid
             if "创建项目" in query.replace(" ", ""):
                 queries = [q for q in queries if "创建项目" in q.replace(" ", "") or "创建工作空间" not in q.replace(" ", "")]
             # 原始查询也保留，去重
@@ -479,21 +495,35 @@ class MCPToolManager:
             info["error"] = str(ex)
             return [query], info
 
+    @staticmethod
+    def _query_anchors(query):
+        pattern = (r"[A-Za-z][A-Za-z0-9_]*:[A-Za-z][A-Za-z0-9_]*|"
+                   r"\b(?:RATE_LIMITED|QUOTA_EXCEEDED)\b|"
+                   r"(?<![A-Za-z0-9])[45]\d{2}(?![A-Za-z0-9])|"
+                   r"(?:proj|ws)_[A-Za-z0-9_-]+|/sandbox/[A-Za-z0-9_./{}?=&%-]+")
+        return {match.lower() for match in re.findall(pattern, query, re.I)}
+
 
     async def _rerank_with_diagnostics(self, query: str, items: List[Any], top_k: int) -> Tuple[List[Any], Dict[str, Any]]:
         """
         用 LLM 对召回结果重新打分排序。
 
-        解决问题：向量检索的相似度分数不等于"对用户有用"，
-        LLM 能理解语义相关性，重排后 Top-K 质量显著提升。
+        保留有效的部分排序，缺失项按召回顺序补齐，并记录完整性。
         """
         if len(items) <= top_k:
             return items, {"status": "skipped"}
 
-        # 将结果序列化为文本供 LLM 评分
-        items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
-                               for i, item in enumerate(items))
-        prompt = f"""根据用户查询，对以下检索结果按相关性打分（0-10），返回 JSON 数组。
+        # 正文单独取预算，避免哈希、分数等元数据挤掉真正的证据。
+        previews = [
+            {"title": str(item.get("title", ""))[:120],
+             "source": str(item.get("source", ""))[:180],
+             "content": str(item.get("content", ""))[:900]}
+            if isinstance(item, dict) else str(item)[:900] for item in items
+        ]
+        items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)}"
+                               for i, item in enumerate(previews))
+        prompt = f"""根据用户查询，对以下检索结果按相关性降序排列，返回索引的 JSON 数组。
+优先覆盖问题所需的完整规则、条件、操作入口和参数；复合问题兼顾各子问题，不把示例当成用户事实。
 用户查询: "{query}"
 检索结果:
 {items_text}
@@ -510,8 +540,13 @@ class MCPToolManager:
             ), timeout=8)
             info.update(response_metadata(resp))
             order = parse_json_response(resp, list)
-            if not all(type(i) is int for i in order) or sorted(order) != list(range(len(items))):
+            if not order or not all(type(i) is int and 0 <= i < len(items) for i in order):
                 raise ValueError("invalid_rerank_indices")
+            unique = list(dict.fromkeys(order))
+            info["ranking_complete"] = len(unique) == len(items)
+            info["returned_unique_indices"] = len(unique)
+            seen = set(unique)
+            order = unique + [i for i in range(len(items)) if i not in seen]
             info["status"] = "applied"
             return [items[i] for i in order[:top_k]], info
         except Exception as ex:

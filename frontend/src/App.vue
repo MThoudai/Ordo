@@ -143,12 +143,12 @@
           <div class="card-heading"><div><span class="kicker">资料检索</span><h2>查找相关说明</h2></div></div>
           <div class="search-line"><input v-model="searchQuery" placeholder="例如：guest 可以编辑项目文档吗？" aria-label="知识检索问题" @keydown.enter="searchKnowledge" /><button @click="searchKnowledge" :disabled="busy || !searchQuery.trim()">{{ searchBusy ? '检索中' : '搜索' }}</button></div>
           <label class="checkbox-line"><input v-model="enhancedSearch" type="checkbox" :disabled="searchBusy" /><span>增强检索（调用模型进行改写与重排）</span></label>
-          <p class="small-copy muted">默认直接检索，不调用模型。相似度只用于排序，不代表答案正确率。</p>
+          <p class="small-copy muted">默认使用向量与关键词混合检索，不调用模型。检索分只用于排序，不代表答案正确率。</p>
           <p v-if="searchError" class="inline-error" role="alert">{{ searchError }}</p>
           <div v-if="searchResults.length" class="result-list">
             <article v-for="(item, index) in searchResults" :key="item.chunk_id || index" class="result-item">
               <span class="result-number">{{ String(index + 1).padStart(2, '0') }}</span>
-              <div><div class="result-title"><strong>{{ item.title || '未命名文档' }}</strong><small>相似度 {{ formatScore(item.score) }}</small></div>
+              <div><div class="result-title"><strong>{{ item.title || '未命名文档' }}</strong><small>检索分 {{ formatScore(item.score) }}</small></div>
                 <p class="source-meta">{{ item.source || '来源未标注' }} · {{ item.version || '版本未标注' }}</p><p>{{ item.content }}</p>
               </div>
             </article>

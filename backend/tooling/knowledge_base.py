@@ -16,6 +16,8 @@ from typing import Any, Dict, List
 
 import chromadb
 
+from tooling.retrieval import BM25Index, chunk_markdown, fuse_rankings
+
 logger = logging.getLogger(__name__)
 
 
@@ -23,6 +25,7 @@ class KnowledgeBase:
     _WRITE_LOCK = threading.RLock()
     COLLECTION_NAME = "saas_knowledge_base"
     CORPUS_ID = "ordo_saas"
+    CHUNKING_VERSION = "markdown-token240-v1"
     CORPUS_DIR = Path(__file__).resolve().parents[1] / "knowledge" / "saas"
 
     def __init__(
@@ -149,7 +152,7 @@ class KnowledgeBase:
             version = str(doc.get("version", "local"))
             checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
             chunks = self._chunk_text(content)
-            ids = [hashlib.sha256(f"{document_id}:{version}:{checksum}:{i}".encode("utf-8")).hexdigest() for i in range(len(chunks))]
+            ids = [hashlib.sha256(f"{document_id}:{version}:{checksum}:{self.CHUNKING_VERSION}:{i}".encode("utf-8")).hexdigest() for i in range(len(chunks))]
             metadata = [{
                 "title": title,
                 "document_id": document_id,
@@ -162,9 +165,11 @@ class KnowledgeBase:
                 "corpus_id": doc.get("corpus_id", "manual_upload"),
                 "agents": doc.get("agents", "general,collaboration,technical"),
                 "knowledge_domain": "saas",
+                "chunking_version": self.CHUNKING_VERSION,
             } for i in range(len(chunks))]
             # 写入成功以后删除同文档旧片段，失败不提前移除有效资料。
             self._collection.upsert(ids=ids, documents=chunks, metadatas=metadata)
+            self._lexical_index = None
             previous = self._collection.get(where={"document_id": document_id}, include=[])
             obsolete = sorted(set(previous["ids"]) - set(ids))
             if obsolete:
@@ -176,29 +181,43 @@ class KnowledgeBase:
         return await asyncio.to_thread(self.add_documents, documents)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """仅检索 SaaS 集合；score 为 1-cosine_distance，不是正确概率。"""
+        """仅检索 SaaS 集合，向量与 BM25 通过 RRF 融合；score 不是正确概率。"""
         count = self._collection.count()
         if not query.strip() or count == 0:
             return []
         top_k = max(1, min(int(top_k), 20, count))
-        results = self._collection.query(query_texts=[query], n_results=top_k)
+        candidate_k = min(max(top_k * 2, 10), count)
+        results = self._collection.query(query_texts=[query], n_results=candidate_k)
         items = []
         for chunk_id, content, meta, distance in zip(
             results["ids"][0], results["documents"][0], results["metadatas"][0], results["distances"][0],
         ):
-            meta = meta or {}
-            items.append({
+            item = self._search_item(chunk_id, content, meta)
+            item["vector_score"] = round(1.0 - distance, 4)
+            items.append(item)
+        with self._WRITE_LOCK:
+            index = getattr(self, "_lexical_index", None)
+            if index is None or len(index.records) != count:
+                snapshot = self._collection.get(include=["documents", "metadatas"])
+                index = BM25Index([
+                    self._search_item(chunk_id, content, meta)
+                    for chunk_id, content, meta in zip(snapshot["ids"], snapshot["documents"], snapshot["metadatas"])
+                ])
+                self._lexical_index = index
+        return fuse_rankings([items, index.search(query, candidate_k)], top_k)
+
+    def _search_item(self, chunk_id, content, meta):
+        meta = meta or {}
+        return {
                 "title": meta.get("title", ""),
                 "content": content,
-                "score": round(1.0 - distance, 4),
                 "chunk": meta.get("chunk_index", 0),
                 "chunk_id": chunk_id,
                 "document_id": meta.get("document_id", ""),
                 "version": meta.get("version", ""),
                 "source": meta.get("source", ""),
                 "collection": self.COLLECTION_NAME,
-            })
-        return items
+        }
 
     async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         return await asyncio.to_thread(self.search, query, top_k)
@@ -215,49 +234,4 @@ class KnowledgeBase:
 
     @staticmethod
     def _chunk_text(text: str, chunk_size: int = 700) -> List[str]:
-        """保留 Markdown 标题、段落、表格及代码块；有界分割超长块。"""
-        if chunk_size < 1:
-            raise ValueError("chunk_size 必须为正数")
-        blocks, lines, in_code = [], [], False
-        for line in text.strip().splitlines():
-            if line.lstrip().startswith("```"):
-                in_code = not in_code
-            if not in_code and not line.strip():
-                if lines:
-                    blocks.append("\n".join(lines))
-                    lines = []
-            else:
-                lines.append(line)
-        if lines:
-            blocks.append("\n".join(lines))
-
-        chunks, current = [], ""
-        for block in blocks:
-            # 不把不同主题凑成一个长向量：按标题边界保留完整规则章节。
-            # 文档主标题与首个章节合并，避免单独索引一个没有正文的标题。
-            if re.match(r"^#{1,3} ", block) and current and not re.fullmatch(r"#[^#\n]+", current):
-                chunks.append(current)
-                current = ""
-            # 一般规则、表格、示例都在上限内；超长块按换行/句子再分。
-            pieces = [block] if len(block) <= chunk_size else re.split(r"(?<=。)|(?<=\n)", block)
-            for piece in pieces:
-                piece = piece.strip()
-                if not piece:
-                    continue
-                while len(piece) > chunk_size:
-                    if current:
-                        chunks.append(current)
-                        current = ""
-                    chunks.append(piece[:chunk_size])
-                    piece = piece[chunk_size:]
-                if not piece:
-                    continue
-                candidate = f"{current}\n\n{piece}" if current else piece
-                if len(candidate) > chunk_size:
-                    chunks.append(current)
-                    current = piece
-                else:
-                    current = candidate
-        if current:
-            chunks.append(current)
-        return chunks
+        return chunk_markdown(text, chunk_size=chunk_size)
